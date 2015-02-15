@@ -74,6 +74,7 @@ use url::Url;
 pub use error::{Error, ConnectError, SqlState, DbError, ErrorPosition};
 #[doc(inline)]
 pub use types::{Oid, Type, Kind, ToSql, FromSql};
+use types::IsNull;
 #[doc(inline)]
 pub use types::Slice;
 use io::{InternalStream, Timeout};
@@ -726,12 +727,17 @@ impl InnerConnection {
         }
 
         // Ew @ doing this manually :(
+        let mut buf = vec![];
+        let value = match try!(oid.to_sql_checked(&Type::Oid, &mut buf)) {
+            IsNull::Yes => None,
+            IsNull::No => Some(buf),
+        };
         try!(self.write_messages(&[
             Bind {
                 portal: "",
                 statement: TYPEINFO_QUERY,
                 formats: &[1],
-                values: &[try!(oid.to_sql(&Type::Oid))],
+                values: &[value],
                 result_formats: &[1]
             },
             Execute {
@@ -1321,7 +1327,11 @@ impl<'conn> Statement<'conn> {
                 params.len());
         let mut values = vec![];
         for (param, ty) in params.iter().zip(self.param_types.iter()) {
-            values.push(try!(param.to_sql(ty)));
+            let mut buf = vec![];
+            match try!(param.to_sql_checked(ty, &mut buf)) {
+                IsNull::Yes => values.push(None),
+                IsNull::No => values.push(Some(buf)),
+            }
         };
 
         try!(conn.write_messages(&[
@@ -1929,13 +1939,14 @@ impl<'a> CopyInStatement<'a> {
             loop {
                 match (row.next(), types.next()) {
                     (Some(val), Some(ty)) => {
-                        match val.to_sql(ty) {
-                            Ok(None) => {
+                        let mut inner_buf = vec![];
+                        match val.to_sql_checked(ty, &mut inner_buf) {
+                            Ok(IsNull::Yes) => {
                                 let _ = buf.write_be_i32(-1);
                             }
-                            Ok(Some(val)) => {
-                                let _ = buf.write_be_i32(val.len() as i32);
-                                let _ = buf.write_all(&val);
+                            Ok(IsNull::No) => {
+                                let _ = buf.write_be_i32(inner_buf.len() as i32);
+                                let _ = buf.write_all(&inner_buf);
                             }
                             Err(err) => {
                                 // FIXME this is not the right way to handle this
