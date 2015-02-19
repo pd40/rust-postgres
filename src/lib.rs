@@ -1441,8 +1441,7 @@ impl<'conn> Statement<'conn> {
         Ok(num)
     }
 
-    /// Executes the prepared statement, returning an iterator over the
-    /// resulting rows.
+    /// Executes the prepared statement, returning the resulting rows.
     ///
     /// ## Panics
     ///
