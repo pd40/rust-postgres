@@ -1682,7 +1682,7 @@ impl<'a> Row<'a> {
     }
 
     /// Returns a slice describing the columns of the `Row`.
-    pub fn columns(&self) -> &[Column] {
+    pub fn columns(&self) -> &'a [Column] {
         self.stmt.columns()
     }
 
