@@ -1,11 +1,11 @@
 pub use ugh_privacy::DbError;
 
-use std::error;
-use std::old_io::IoError;
-use std::fmt;
-
 use openssl::ssl::error::SslError;
 use phf;
+use std::error;
+use std::fmt;
+use std::io;
+use std::old_io::IoError;
 
 use Result;
 use types::Type;
@@ -392,7 +392,7 @@ pub enum ConnectError {
     /// There was an error initializing the SSL session
     SslError(SslError),
     /// There was an error communicating with the server
-    IoError(IoError),
+    IoError(io::Error),
     /// The server sent an unexpected response
     BadResponse,
 }
@@ -434,8 +434,8 @@ impl error::Error for ConnectError {
     }
 }
 
-impl error::FromError<IoError> for ConnectError {
-    fn from_error(err: IoError) -> ConnectError {
+impl error::FromError<io::Error> for ConnectError {
+    fn from_error(err: io::Error) -> ConnectError {
         ConnectError::IoError(err)
     }
 }
@@ -472,7 +472,7 @@ pub enum Error {
     /// An error reported by the Postgres server
     DbError(DbError),
     /// An error communicating with the Postgres server
-    IoError(IoError),
+    IoError(io::Error),
     /// The communication channel with the Postgres server has desynchronized
     /// due to an earlier communications error.
     StreamDesynchronized,
@@ -527,8 +527,8 @@ impl error::FromError<DbError> for Error {
     }
 }
 
-impl error::FromError<IoError> for Error {
-    fn from_error(err: IoError) -> Error {
+impl error::FromError<io::Error> for Error {
+    fn from_error(err: io::Error) -> Error {
         Error::IoError(err)
     }
 }

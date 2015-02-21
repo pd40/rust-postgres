@@ -7,12 +7,12 @@ use std::string::String;
 use std::str::StrExt;
 use std::slice::SliceExt;
 
-use std::old_io::{self, IoResult, IoError, OtherIoError, ByRefReader, Buffer};
+use std::io;
+use std::io::prelude::*;
 use std::old_io::util::LimitReader;
 use std::mem;
-use byteorder::{BigEndian, ReaderBytesExt, WriterBytesExt};
+use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
-use io::Timeout;
 use types::Oid;
 
 use self::BackendMessage::*;
@@ -144,11 +144,11 @@ pub enum FrontendMessage<'a> {
 
 #[doc(hidden)]
 trait WriteCStr {
-    fn write_cstr(&mut self, s: &str) -> IoResult<()>;
+    fn write_cstr(&mut self, s: &str) -> io::Result<()>;
 }
 
-impl<W: old_io::Writer> WriteCStr for W {
-    fn write_cstr(&mut self, s: &str) -> IoResult<()> {
+impl<W: Write> WriteCStr for W {
+    fn write_cstr(&mut self, s: &str) -> io::Result<()> {
         try!(self.write_all(s.as_bytes()));
         self.write_u8(0)
     }
@@ -156,11 +156,11 @@ impl<W: old_io::Writer> WriteCStr for W {
 
 #[doc(hidden)]
 pub trait WriteMessage {
-    fn write_message(&mut self, &FrontendMessage) -> IoResult<()> ;
+    fn write_message(&mut self, &FrontendMessage) -> io::Result<()> ;
 }
 
-impl<W: old_io::Writer> WriteMessage for W {
-    fn write_message(&mut self, message: &FrontendMessage) -> IoResult<()> {
+impl<W: Write> WriteMessage for W {
+    fn write_message(&mut self, message: &FrontendMessage) -> io::Result<()> {
         let mut buf = vec![];
         let mut ident = None;
 
@@ -181,7 +181,7 @@ impl<W: old_io::Writer> WriteMessage for W {
                         None => try!(buf.write_i32::<BigEndian>(-1)),
                         Some(ref value) => {
                             try!(buf.write_i32::<BigEndian>(value.len() as i32));
-                            try!(old_io::Writer::write_all(&mut buf, &**value));
+                            try!(buf.write_all(&**value));
                         }
                     }
                 }
@@ -203,7 +203,7 @@ impl<W: old_io::Writer> WriteMessage for W {
             }
             CopyData { data } => {
                 ident = Some(b'd');
-                try!(old_io::Writer::write_all(&mut buf, data));
+                try!(buf.write_all(data));
             }
             CopyDone => ident = Some(b'c'),
             CopyFail { message } => {
@@ -264,40 +264,32 @@ impl<W: old_io::Writer> WriteMessage for W {
 
 #[doc(hidden)]
 trait ReadCStr {
-    fn read_cstr(&mut self) -> IoResult<String>;
+    fn read_cstr(&mut self) -> io::Result<String>;
 }
 
-impl<R: Buffer> ReadCStr for R {
-    fn read_cstr(&mut self) -> IoResult<String> {
-        let mut buf = try!(self.read_until(0));
+impl<R: BufRead> ReadCStr for R {
+    fn read_cstr(&mut self) -> io::Result<String> {
+        let mut buf = vec![];
+        try!(self.read_until(0, &mut buf));
         buf.pop();
-        String::from_utf8(buf).map_err(|_| IoError {
-            kind: OtherIoError,
-            desc: "Received a non-utf8 string from server",
-            detail: None
-        })
+        String::from_utf8(buf)
+            .map_err(|_| io::Error::new(io::ErrorKind::Other,
+                                        "Received a non-utf8 string from server",
+                                        None))
     }
 }
 
 #[doc(hidden)]
 pub trait ReadMessage {
-    fn read_message(&mut self) -> IoResult<BackendMessage>;
+    fn read_message(&mut self) -> io::Result<BackendMessage>;
 }
 
-impl<R: Buffer+Timeout> ReadMessage for R {
-    fn read_message(&mut self) -> IoResult<BackendMessage> {
-        // The first byte read is a bit complex to make
-        // Notifications::next_block_for work.
-        let ident = self.read_u8();
-        // At this point we've got to turn off any read timeout to prevent
-        // stream desynchronization. We're assuming that if we've got the first
-        // byte, there's more stuff to follow.
-        self.set_read_timeout(None);
-        let ident = try!(ident);
-
+impl<R: BufRead> ReadMessage for R {
+    fn read_message(&mut self) -> io::Result<BackendMessage> {
+        let ident = try!(self.read_u8());
         // subtract size of length value
         let len = try!(self.read_u32::<BigEndian>()) as usize - mem::size_of::<i32>();
-        let mut rdr = LimitReader::new(self.by_ref(), len);
+        let mut rdr = self.by_ref().take(len as u64);
 
         let ret = match ident {
             b'1' => ParseComplete,
@@ -338,24 +330,20 @@ impl<R: Buffer+Timeout> ReadMessage for R {
             b't' => try!(read_parameter_description(&mut rdr)),
             b'T' => try!(read_row_description(&mut rdr)),
             b'Z' => ReadyForQuery { _state: try!(rdr.read_u8()) },
-            ident => return Err(IoError {
-                kind: OtherIoError,
-                desc: "Unexpected message tag",
-                detail: Some(format!("got {}", ident)),
-            })
+            ident => {
+                return Err(io::Error::new(io::ErrorKind::Other,
+                                          "Unexpected message tag",
+                                          Some(format!("got {}", ident))));
+            }
         };
         if rdr.limit() != 0 {
-            return Err(IoError {
-                kind: OtherIoError,
-                desc: "didn't read entire message",
-                detail: None,
-            });
+            return Err(io::Error::new(io::ErrorKind::Other, "didn't read entire message",None));
         }
         Ok(ret)
     }
 }
 
-fn read_fields<R: Buffer>(buf: &mut R) -> IoResult<Vec<(u8, String)>> {
+fn read_fields<R: BufRead>(buf: &mut R) -> io::Result<Vec<(u8, String)>> {
     let mut fields = vec![];
     loop {
         let ty = try!(buf.read_u8());
@@ -369,14 +357,19 @@ fn read_fields<R: Buffer>(buf: &mut R) -> IoResult<Vec<(u8, String)>> {
     Ok(fields)
 }
 
-fn read_data_row<R: Buffer>(buf: &mut R) -> IoResult<BackendMessage> {
-    let len = try!(buf.read_be_u16()) as usize;
+fn read_data_row<R: Read>(buf: &mut R) -> io::Result<BackendMessage> {
+    let len = try!(buf.read_u16::<BigEndian>()) as usize;
     let mut values = Vec::with_capacity(len);
 
     for _ in 0..len {
-        let val = match try!(buf.read_be_i32()) {
+        let val = match try!(buf.read_i32::<BigEndian>()) {
             -1 => None,
-            len => Some(try!(buf.read_exact(len as usize)))
+            len => {
+                let rdr = buf.by_ref().take(len as u64);
+                let mut vec = vec![];
+                try!(buf.read_to_end(&mut vec));
+                Some(vec)
+            }
         };
         values.push(val);
     }
@@ -384,29 +377,40 @@ fn read_data_row<R: Buffer>(buf: &mut R) -> IoResult<BackendMessage> {
     Ok(DataRow { row: values })
 }
 
-fn read_auth_message<R: Buffer>(buf: &mut R) -> IoResult<BackendMessage> {
-    Ok(match try!(buf.read_be_i32()) {
+fn read_all<R: Read>(r: &mut R, mut buf: &mut [u8]) -> io::Result<()> {
+    while !buf.is_empty() {
+        match r.read(buf) {
+            Ok(0) => return Err(io::Error::new(io::ErrorKind::Other, "reached EOF", None)),
+            Ok(n) => buf = &mut buf[n..],
+            Err(e) => return Err(e)
+        }
+    }
+    Ok(())
+}
+
+fn read_auth_message<R: Read>(buf: &mut R) -> io::Result<BackendMessage> {
+    Ok(match try!(buf.read_i32::<BigEndian>()) {
         0 => AuthenticationOk,
         2 => AuthenticationKerberosV5,
         3 => AuthenticationCleartextPassword,
         5 => {
             let mut salt = [0; 4];
-            try!(buf.read_at_least(salt.len(), &mut salt));
+            try!(read_all(buf, &mut salt));
             AuthenticationMD5Password { salt: salt }
         },
         6 => AuthenticationSCMCredential,
         7 => AuthenticationGSS,
         9 => AuthenticationSSPI,
-        val => return Err(IoError {
-            kind: OtherIoError,
-            desc: "Unexpected authentication tag",
-            detail: Some(format!("got {}", val)),
-        })
+        val => {
+            return Err(io::Error::new(io::ErrorKind::Other,
+                                      "Unexpected authentication tag",
+                                      Some(format!("got {}", val))));
+        }
     })
 }
 
-fn read_parameter_description<R: Buffer>(buf: &mut R) -> IoResult<BackendMessage> {
-    let len = try!(buf.read_be_i16()) as usize;
+fn read_parameter_description<R: Read>(buf: &mut R) -> io::Result<BackendMessage> {
+    let len = try!(buf.read_i16::<BigEndian>()) as usize;
     let mut types = Vec::with_capacity(len);
 
     for _ in 0..len {
@@ -416,19 +420,19 @@ fn read_parameter_description<R: Buffer>(buf: &mut R) -> IoResult<BackendMessage
     Ok(ParameterDescription { types: types })
 }
 
-fn read_row_description<R: Buffer>(buf: &mut R) -> IoResult<BackendMessage> {
-    let len = try!(buf.read_be_i16()) as usize;
+fn read_row_description<R: Read>(buf: &mut R) -> io::Result<BackendMessage> {
+    let len = try!(buf.read_i16::<BigEndian>()) as usize;
     let mut types = Vec::with_capacity(len);
 
     for _ in 0..len {
         types.push(RowDescriptionEntry {
             name: try!(buf.read_cstr()),
             table_oid: try!(buf.read_u32::<BigEndian>()),
-            column_id: try!(buf.read_be_i16()),
+            column_id: try!(buf.read_i16::<BigEndian>()),
             type_oid: try!(buf.read_u32::<BigEndian>()),
-            type_size: try!(buf.read_be_i16()),
-            type_modifier: try!(buf.read_be_i32()),
-            format: try!(buf.read_be_i16())
+            type_size: try!(buf.read_i16::<BigEndian>()),
+            type_modifier: try!(buf.read_i32::<BigEndian>()),
+            format: try!(buf.read_i16::<BigEndian>())
         })
     }
 

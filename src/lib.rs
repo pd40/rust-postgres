@@ -54,6 +54,8 @@ extern crate openssl;
 extern crate phf;
 extern crate "rustc-serialize" as serialize;
 extern crate time;
+#[cfg(feature = "unix_socket")]
+extern crate unix_socket;
 
 use openssl::crypto::hash::{self, Hasher};
 use openssl::ssl::{SslContext, MaybeSslStream};
@@ -64,8 +66,9 @@ use std::cmp::max;
 use std::collections::{VecDeque, HashMap};
 use std::fmt;
 use std::iter::{IntoIterator, RandomAccessIterator};
-use std::old_io::{BufferedStream, IoResult, IoError, IoErrorKind};
-use std::old_io::net::ip::Port;
+use std::io::{self, BufStream};
+use std::io::prelude::*;
+use std::path::PathBuf;
 use std::mem;
 use std::slice;
 use std::result;
@@ -79,7 +82,7 @@ pub use error::{Error, ConnectError, SqlState, DbError, ErrorPosition};
 pub use types::{Oid, Type, Kind, ToSql, FromSql};
 #[doc(inline)]
 pub use types::Slice;
-use io::{InternalStream, Timeout};
+use io_util::MainStream;
 use message::BackendMessage::*;
 use message::FrontendMessage::*;
 use message::{FrontendMessage, BackendMessage, RowDescriptionEntry};
@@ -89,7 +92,7 @@ use message::{WriteMessage, ReadMessage};
 mod macros;
 
 mod error;
-mod io;
+mod io_util;
 mod message;
 mod ugh_privacy;
 mod url;
@@ -108,7 +111,10 @@ pub enum ConnectTarget {
     /// Connect via TCP to the specified host.
     Tcp(String),
     /// Connect via a Unix domain socket in the specified directory.
-    Unix(Path)
+    ///
+    /// Only available with the `unix_socket` feature.
+    #[cfg(feature = "unix_socket")]
+    Unix(PathBuf)
 }
 
 /// Authentication information
@@ -128,7 +134,7 @@ pub struct ConnectParams {
     /// The target port.
     ///
     /// Defaults to 5432 if not specified.
-    pub port: Option<Port>,
+    pub port: Option<u16>,
     /// The user to login as.
     ///
     /// `Connection::connect` requires a user but `cancel_query` does not.
@@ -170,13 +176,22 @@ impl IntoConnectParams for Url {
             ..
         } = self;
 
-        let maybe_path = try!(url::decode_component(&host).map_err(ConnectError::InvalidUrl));
-        let target = if maybe_path.starts_with("/") {
-            ConnectTarget::Unix(Path::new(maybe_path))
-        } else {
-            ConnectTarget::Tcp(host)
-        };
+        #[cfg(feature = "unix_socket")]
+        fn make_target(host: String) -> result::Result<ConnectTarget, ConnectError> {
+            let maybe_path = try!(url::decode_component(&host).map_err(ConnectError::InvalidUrl));
+            let target = if maybe_path.starts_with("/") {
+                Ok(ConnectTarget::Unix(Path::new(maybe_path)))
+            } else {
+                Ok(ConnectTarget::Tcp(host))
+            };
+        }
 
+        #[cfg(not(feature = "unix_socket"))]
+        fn make_target(host: String) -> result::Result<ConnectTarget, ConnectError> {
+            Ok(ConnectTarget::Tcp(host))
+        }
+
+        let target = try!(make_target(host));
         let user = user.map(|url::UserInfo { user, pass }| {
             UserInfo { user: user, password: pass }
         });
@@ -271,6 +286,7 @@ impl<'conn> Notifications<'conn> {
         }
     }
 
+    /*
     /// Returns the oldest pending notification
     ///
     /// If no notifications are pending, blocks for up to `timeout` time, after
@@ -324,6 +340,7 @@ impl<'conn> Notifications<'conn> {
             }
         }
     }
+    */
 }
 
 /// Contains information necessary to cancel queries for a session
@@ -365,7 +382,7 @@ pub struct CancelData {
 pub fn cancel_query<T>(params: T, ssl: &SslMode, data: CancelData)
                        -> result::Result<(), ConnectError> where T: IntoConnectParams {
     let params = try!(params.into_connect_params());
-    let mut socket = try!(io::initialize_stream(&params, ssl));
+    let mut socket = try!(io_util::initialize_stream(&params, ssl));
 
     try!(socket.write_message(&CancelRequest {
         code: message::CANCEL_CODE,
@@ -385,7 +402,7 @@ struct CachedStatement {
 }
 
 struct InnerConnection {
-    stream: BufferedStream<MaybeSslStream<InternalStream>>,
+    stream: BufStream<MainStream>,
     notice_handler: Box<NoticeHandler>,
     notifications: VecDeque<Notification>,
     cancel_data: CancelData,
@@ -411,14 +428,14 @@ impl InnerConnection {
     fn connect<T>(params: T, ssl: &SslMode) -> result::Result<InnerConnection, ConnectError>
             where T: IntoConnectParams {
         let params = try!(params.into_connect_params());
-        let stream = try!(io::initialize_stream(&params, ssl));
+        let stream = try!(io_util::initialize_stream(&params, ssl));
 
         let ConnectParams { user, database, mut options, .. } = params;
 
         let user = try!(user.ok_or(ConnectError::MissingUser));
 
         let mut conn = InnerConnection {
-            stream: BufferedStream::new(stream),
+            stream: BufStream::new(stream),
             next_stmt_id: 0,
             notice_handler: Box::new(DefaultNoticeHandler),
             notifications: VecDeque::new(),
@@ -491,7 +508,7 @@ impl InnerConnection {
         }
     }
 
-    fn write_messages(&mut self, messages: &[FrontendMessage]) -> IoResult<()> {
+    fn write_messages(&mut self, messages: &[FrontendMessage]) -> io::Result<()> {
         debug_assert!(!self.desynchronized);
         for message in messages {
             try_desync!(self, self.stream.write_message(message));
@@ -499,7 +516,7 @@ impl InnerConnection {
         Ok(try_desync!(self, self.stream.flush()))
     }
 
-    fn read_one_message(&mut self) -> IoResult<Option<BackendMessage>> {
+    fn read_one_message(&mut self) -> io::Result<Option<BackendMessage>> {
         debug_assert!(!self.desynchronized);
         match try_desync!(self, self.stream.read_message()) {
             NoticeResponse { fields } => {
@@ -516,7 +533,7 @@ impl InnerConnection {
         }
     }
 
-    fn read_message_with_notification(&mut self) -> IoResult<BackendMessage> {
+    fn read_message_with_notification(&mut self) -> io::Result<BackendMessage> {
         loop {
             if let Some(msg) = try!(self.read_one_message()) {
                 return Ok(msg);
@@ -524,7 +541,7 @@ impl InnerConnection {
         }
     }
 
-    fn read_message(&mut self) -> IoResult<BackendMessage> {
+    fn read_message(&mut self) -> io::Result<BackendMessage> {
         loop {
             match try!(self.read_message_with_notification()) {
                 NotificationResponse { pid, channel, payload } => {
